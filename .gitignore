@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/cache/
+.tabpfn_models/
+.env
+
+# Local planning notes, not part of the project
+PLAN.md
+TEMPLATE.md
+HANDOFF.md

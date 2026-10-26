@@ -1,0 +1,10 @@
+.venv
+.git
+data/cache
+__pycache__
+*.pyc
+docs/*.mp4
+.pytest_cache
+PLAN.md
+TEMPLATE.md
+HANDOFF.md
