@@ -14,7 +14,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
-from .features import FEATURES
+from .features import FEATURES, parse_time, pr_features
 
 warnings.filterwarnings("ignore", message=".*Running on CPU with more than.*")
 
@@ -63,32 +63,60 @@ def check_history(y) -> None:
         )
 
 
-def cross_validate(X: pd.DataFrame, y, folds: int = 5, seed: int = 0) -> dict:
+def split_features(train_prs: list[dict], test_prs: list[dict]) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame, np.ndarray]:
+    """Features for a train/test split where only training outcomes count as author history.
+
+    Building features once over every closed PR would let a training row's
+    "author's earlier merged PRs" encode a held-out PR's label.
+    """
+    X_train = to_frame([pr_features(p, train_prs) for p in train_prs])
+    X_test = to_frame([pr_features(p, train_prs) for p in test_prs])
+    y_train = np.array([int(p["merged"]) for p in train_prs])
+    y_test = np.array([int(p["merged"]) for p in test_prs])
+    return X_train, y_train, X_test, y_test
+
+
+def time_split(closed: list[dict], holdout: float = 0.2) -> tuple[list[dict], list[dict]]:
+    """Forecast split: test on the newest 20 % by creation time, train only on PRs closed before the cutoff.
+
+    The cutoff is the creation time of the oldest test PR, so the model knows
+    exactly what a maintainer could have known at that moment.
+    """
+    by_created = sorted(closed, key=lambda p: p["created_at"])
+    cut = int(len(by_created) * (1 - holdout))
+    cutoff = parse_time(by_created[cut]["created_at"])
+    train = [p for p in by_created[:cut] if parse_time(p["closed_at"]) < cutoff]
+    return train, by_created[cut:]
+
+
+def _two_classes(*ys) -> bool:
+    return all(len(set(np.asarray(y).tolist())) == 2 for y in ys)
+
+
+def cross_validate(closed: list[dict], folds: int = 5, seed: int = 0) -> dict:
     """5-fold stratified CV ROC-AUC for TabPFN and the baseline on identical folds."""
-    y = np.asarray(y)
+    y = np.array([int(p["merged"]) for p in closed])
     check_history(y)
     skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
     scores = {"tabpfn": [], "logreg": []}
-    for train, test in skf.split(X, y):
+    for train, test in skf.split(np.zeros(len(y)), y):
+        X_tr, y_tr, X_te, y_te = split_features([closed[i] for i in train], [closed[i] for i in test])
         for name, model in (("tabpfn", make_tabpfn(seed)), ("logreg", make_baseline())):
-            model.fit(X.iloc[train], y[train])
-            proba = model.predict_proba(X.iloc[test])[:, 1]
-            scores[name].append(roc_auc_score(y[test], proba))
+            model.fit(X_tr, y_tr)
+            scores[name].append(roc_auc_score(y_te, model.predict_proba(X_te)[:, 1]))
     return {name: (float(np.mean(s)), float(np.std(s))) for name, s in scores.items()}
 
 
-def time_split_auc(X: pd.DataFrame, y, created: list[str], holdout: float = 0.2, seed: int = 0) -> dict:
-    """Train on the oldest 80 %, score the newest 20 %: the honest 'predict the future' check."""
-    y = np.asarray(y)
-    order = np.argsort(pd.to_datetime(pd.Series(created)).to_numpy())
-    cut = int(len(order) * (1 - holdout))
-    train, test = order[:cut], order[cut:]
-    if len(set(y[test])) < 2:
+def time_split_auc(closed: list[dict], seed: int = 0) -> dict:
+    """ROC-AUC of both models on the forecast split; {} when either side lacks a class."""
+    train, test = time_split(closed)
+    X_tr, y_tr, X_te, y_te = split_features(train, test)
+    if not _two_classes(y_tr, y_te):
         return {}
-    out = {}
+    out = {"n_train": len(train), "n_test": len(test)}
     for name, model in (("tabpfn", make_tabpfn(seed)), ("logreg", make_baseline())):
-        model.fit(X.iloc[train], y[train])
-        out[name] = float(roc_auc_score(y[test], model.predict_proba(X.iloc[test])[:, 1]))
+        model.fit(X_tr, y_tr)
+        out[name] = float(roc_auc_score(y_te, model.predict_proba(X_te)[:, 1]))
     return out
 
 

@@ -5,7 +5,6 @@ from mergemeter.features import (
     build_dataset,
     docs_only,
     draft_features,
-    early_activity,
     has_linked_issue,
     label_flags,
     parse_time,
@@ -13,6 +12,7 @@ from mergemeter.features import (
     touches_tests,
 )
 from mergemeter.github import GitHubError, parse_repo
+from mergemeter.model import split_features, time_split
 
 
 def make_pr(number, *, author="alice", merged=False, state="closed", created="2026-10-01T00:00:00Z",
@@ -22,7 +22,7 @@ def make_pr(number, *, author="alice", merged=False, state="closed", created="20
         "state": state, "merged": merged, "created_at": created, "closed_at": closed if state == "closed" else None,
         "merged_at": closed if merged else None, "author": author, "author_is_bot": False,
         "author_association": "NONE", "additions": 10, "deletions": 2, "changed_files": 1,
-        "files": ["src/app.py"], "labels": [], "comments": [], "reviews": [],
+        "files": ["src/app.py"], "labels": [],
     }
     pr.update(extra)
     return pr
@@ -73,19 +73,6 @@ def test_verdict_labels_are_ignored():
                      "label_hacktoberfest": 1.0, "label_deps": 1.0}
 
 
-def test_early_activity_counts_others_in_first_day_before_close():
-    created = parse_time("2026-10-01T00:00:00Z")
-    closed = parse_time("2026-10-01T12:00:00Z")
-    events = [
-        {"at": "2026-10-01T01:00:00Z", "by": "maintainer"},  # counts
-        {"at": "2026-10-01T02:00:00Z", "by": "alice"},       # the author: ignored
-        {"at": "2026-10-01T11:55:00Z", "by": "maintainer"},  # the closing comment: ignored
-        {"at": "2026-10-03T00:00:00Z", "by": "maintainer"},  # after 24 h: ignored
-    ]
-    assert early_activity(events, "alice", created, closed) == 1.0
-    assert math.isnan(early_activity(None, "alice", created, closed))
-
-
 def test_author_history_uses_only_earlier_prs():
     old_merged = make_pr(1, merged=True, created="2026-09-01T00:00:00Z", closed="2026-09-02T00:00:00Z")
     old_rejected = make_pr(2, created="2026-09-03T00:00:00Z", closed="2026-09-04T00:00:00Z")
@@ -105,9 +92,9 @@ def test_maintainer_and_bot_flags():
 
 
 def test_rest_records_leave_size_features_missing():
-    pr = make_pr(1, additions=None, deletions=None, changed_files=None, files=None, comments=None, reviews=None)
+    pr = make_pr(1, additions=None, deletions=None, changed_files=None, files=None)
     feats = pr_features(pr, [])
-    for key in ["additions", "deletions", "changed_files", "touches_tests", "docs_only", "n_comments_24h"]:
+    for key in ["additions", "deletions", "changed_files", "touches_tests", "docs_only"]:
         assert math.isnan(feats[key]), key
 
 
@@ -125,3 +112,35 @@ def test_draft_features_cover_every_feature():
                            title="fix: handle empty body", body="Fixes #7", labels=["bug"])
     assert set(feats) == set(FEATURES)
     assert feats["conventional_title"] == 1.0 and feats["has_linked_issue"] == 1.0 and feats["label_bug"] == 1.0
+
+
+def test_truncated_file_lists_are_inconclusive():
+    # GitHub returned 2 of 40 files: no test seen does not mean no test touched.
+    assert math.isnan(touches_tests(["src/a.py", "src/b.py"], changed_files=40))
+    assert touches_tests(["tests/test_a.py"], changed_files=40) == 1.0
+    assert math.isnan(docs_only(["README.md"], changed_files=40))
+    assert docs_only(["README.md", "src/a.py"], changed_files=40) == 0.0
+
+
+def test_deleted_authors_share_no_history():
+    old = make_pr(1, author=None, merged=True, created="2026-09-01T00:00:00Z", closed="2026-09-02T00:00:00Z")
+    target = make_pr(2, author=None, created="2026-10-01T00:00:00Z")
+    assert pr_features(target, [old, target])["author_prior_merged"] == 0.0
+
+
+def test_split_features_keep_held_out_outcomes_out_of_history():
+    held_out = make_pr(1, merged=True, created="2026-09-01T00:00:00Z", closed="2026-09-02T00:00:00Z")
+    train_row = make_pr(2, created="2026-10-01T00:00:00Z", closed="2026-10-02T00:00:00Z")
+    X_train, y_train, X_test, _ = split_features([train_row], [held_out])
+    assert X_train["author_prior_merged"].tolist() == [0.0]
+    assert y_train.tolist() == [0]
+
+
+def test_time_split_trains_only_on_prs_closed_before_cutoff():
+    prs = [make_pr(i, created=f"2026-10-{i + 1:02d}T00:00:00Z", closed=f"2026-10-{i + 2:02d}T00:00:00Z")
+           for i in range(10)]
+    prs[0]["closed_at"] = "2026-10-30T00:00:00Z"  # opened early, closed after the cutoff
+    train, test = time_split(prs)
+    assert [p["number"] for p in test] == [8, 9]
+    assert 0 not in [p["number"] for p in train]
+    assert all(p["closed_at"] < test[0]["created_at"] for p in train)

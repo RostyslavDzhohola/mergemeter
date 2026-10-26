@@ -37,7 +37,7 @@ rules are written in its PR history, and MergeMeter reads them back to you befor
 
 | Tab | What it shows |
 |---|---|
-| **Open PRs** | Every open PR with its merge chance: 🌼 alive (≥ 70 %), 🕯️ limbo, 👻 ghost (< 40 %) |
+| **Open PRs** | The newest 100 open PRs with their merge chance: 🌼 alive (≥ 70 %), 🕯️ limbo, 👻 ghost (< 40 %) |
 | **What decides a PR's fate** | Permutation importance: how much TabPFN's ROC-AUC on the newest 20 % of PRs drops when each factor is shuffled, and whether more of it helps or hurts |
 | **Draft PR what-if** | Describe a PR you haven't opened (size, tests, linked issue, title, labels, your track record) and get its fortune |
 
@@ -48,23 +48,26 @@ rules are written in its PR history, and MergeMeter reads them back to you befor
 
 ```
 owner/repo ─▶ GitHub GraphQL (300 closed + 100 open PRs, cached 6 h)
-           ─▶ 20 leakage-safe features per PR          (mergemeter/features.py)
+           ─▶ 18 open-time features per PR             (mergemeter/features.py)
            ─▶ TabPFN v2, local CPU, in-context fit     (mergemeter/model.py)
            ─▶ open-PR scores, factor ranking, what-if  (app.py, Gradio)
 ```
 
-**Features** (only what was knowable at open time or in the first 24 hours):
-lines added and deleted, files changed, touches tests, docs-only, author is maintainer, author is a bot, the
-author's earlier merged and unmerged PRs, links an issue, title and description length, conventional-commit
-title, comments and reviews from others in the first 24 h, and topic labels (bug, docs, feature,
+**Features** (what a PR looks like when it is opened): lines added and deleted, files changed, touches
+tests, docs-only, author is maintainer, author is a bot, the author's earlier merged and unmerged PRs, links
+an issue, title and description length, conventional-commit title, and topic labels (bug, docs, feature,
 hacktoberfest, dependencies).
 
 **Leakage guards.** A merge predictor can cheat easily, and the cheats look great in a notebook. MergeMeter avoids:
-- `author_association`: GitHub rewrites `FIRST_TIME_CONTRIBUTOR` to `CONTRIBUTOR` *after* a merge, so it
-  leaks the label. Author history is counted from earlier PRs in the window instead.
+- `author_association`'s contributor levels: GitHub rewrites `FIRST_TIME_CONTRIBUTOR` to `CONTRIBUTOR` *after*
+  a merge, so they leak the label. Author history is counted from PRs that closed before this one opened, and
+  in evaluation only from the *training* PRs, so a held-out PR's outcome never shows up in a training row.
 - Verdict labels (`hacktoberfest-accepted`, `stale`, `wontfix`, `invalid`, ...) are dropped.
-- Comments stop at 24 h *and* 10 minutes before the close, so "Thanks, merged!" never counts.
-- Time-to-close is never a feature. EVAL.md also reports a time-ordered split (train on old PRs, test on new).
+- Comments, reviews and time-to-close are not features at all; the model judges a PR at open time.
+- The time-split check in EVAL.md trains only on PRs that had *closed* before the test period began.
+- File lists GitHub truncates make `touches_tests` / `docs_only` "unknown" rather than guessing.
+- Known gap: GitHub only serves a PR's *current* size, title, body and labels, so edits made after
+  opening can still seep in. Private repos are refused even when the server's token can see them.
 
 **Why TabPFN.** 300 rows is too few for gradient boosting to shine and far too few to train a neural net.
 TabPFN was pre-trained on millions of synthetic tables, so it does Bayesian-style inference on a small
@@ -92,8 +95,7 @@ python app.py                # http://localhost:7860
 ```
 
 The first run downloads the 29 MB TabPFN v2 checkpoint. Without `GITHUB_TOKEN`, MergeMeter uses the
-unauthenticated REST list endpoint ("lite mode": no PR sizes, files or early comments; TabPFN treats them as
-missing) and the bundled snapshots in `data/snapshots/` for the example repos.
+unauthenticated REST list endpoint ("lite mode": no PR sizes or files; TabPFN treats them as missing) and the bundled snapshots in `data/snapshots/` for the example repos.
 
 ```bash
 docker build -t mergemeter . && docker run -p 7860:7860 -e GITHUB_TOKEN mergemeter
@@ -106,7 +108,7 @@ python scripts/eval.py                                 # rebuild EVAL.md from sn
 - It predicts *this repo's past behaviour*, not the quality of your code. A great PR to a repo that never
   merges outside contributions will score low, and that is the point.
 - 300 PRs is a small sample; see the ± spread in EVAL.md.
-- PR size features are final sizes, not size at open time.
+- PR size, title, body and labels are their current values, not necessarily their values at open time.
 
 ## AI-help disclosure
 

@@ -19,7 +19,7 @@ import numpy as np  # noqa: E402
 
 from mergemeter import github  # noqa: E402
 from mergemeter.features import build_dataset  # noqa: E402
-from mergemeter.model import N_ESTIMATORS, cross_validate, time_split_auc, to_frame  # noqa: E402
+from mergemeter.model import N_ESTIMATORS, cross_validate, time_split_auc  # noqa: E402
 
 REPOS = [
     ("huggingface/transformers", "large"),
@@ -53,10 +53,9 @@ def main() -> None:
     for repo, kind in REPOS:
         t0 = time.time()
         data = load(repo, args.refresh)
-        X_rows, y, closed, _, opened = build_dataset(data["prs"])
-        X = to_frame(X_rows)
-        cv = cross_validate(X, y)
-        ts = time_split_auc(X, y, [p["created_at"] for p in closed])
+        _, y, closed, _, opened = build_dataset(data["prs"])
+        cv = cross_validate(closed)
+        ts = time_split_auc(closed)
         rows.append({
             "repo": repo, "kind": kind, "fetched_at": data["fetched_at"], "mode": data["mode"],
             "n": len(y), "merged": int(np.sum(y)), "open": len(opened), "cv": cv, "ts": ts,
@@ -90,13 +89,16 @@ def render(rows: list[dict]) -> str:
         "## Setup",
         "",
         "- Data: the 300 most recent closed PRs per repo (GitHub GraphQL). Label = merged (1) vs closed without merging (0).",
-        "- Features: the 20 leakage-safe features in `mergemeter/features.py` (size, files, tests/docs, author history "
-        "counted from *earlier* PRs only, first-24 h comments and reviews, linked issue, title/body, topic labels).",
+        "- Features: the 18 open-time features in `mergemeter/features.py` (size, files, tests/docs, maintainer/bot, "
+        "author history, linked issue, title/body, topic labels). No comments, reviews or time-to-close.",
+        "- Author history is rebuilt inside every split from the training PRs only, so no held-out outcome "
+        "reaches a training row.",
         f"- TabPFN: open-weight TabPFN v2 classifier checkpoint, local CPU, `n_estimators={N_ESTIMATORS}`, no tuning, "
         "no training loop (in-context learning).",
         "- Baseline: median impute, log1p, standardise, `LogisticRegression(class_weight='balanced')`.",
         "- **5-fold CV**: stratified, shuffled, seed 0, both models on identical folds (mean ± std).",
-        "- **Time split**: train on the oldest 80 % of PRs, test on the newest 20 %: the \"predict the future\" check.",
+        "- **Time split**: test on the newest 20 % of PRs by open date; train only on PRs that had *closed* before "
+        "the oldest test PR opened (so fewer than 240 training rows).",
         "",
         "## Results",
         "",
@@ -121,10 +123,13 @@ def render(rows: list[dict]) -> str:
         "## Caveats",
         "",
         "- 300 PRs is a small sample; fold-to-fold spread (± std) is a few AUC points, so small gaps are noise.",
-        "- `additions`, `deletions` and `changed_files` are the PR's final size, which can drift from its size at "
-        "open time. Every other feature is known at open time or within 24 h.",
+        "- GitHub serves a PR's *current* size, files, title, body and labels, so edits after opening (or topic "
+        "labels added late) can still carry some post-open information. Author history and verdict labels are "
+        "handled; these are not.",
         "- Repos where maintainers and bots drive nearly every merge (fastapi) are easy for both models: "
         "\"who opened it\" carries most of the signal.",
+        "- Where an AUC sits near 0.5 (gradio, and transformers on the time split), open-time features carry little "
+        "signal for that repo. The app shows this per-repo AUC on its stat cards, so you can see when not to trust a score.",
         "- TabPFN 2.5+ checkpoints are licence-gated and non-commercial; this eval uses the open v2 checkpoint "
         "that the app ships with.",
         "",

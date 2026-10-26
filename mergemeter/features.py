@@ -1,21 +1,22 @@
-"""Turn normalised PR records into a leakage-safe feature table.
+"""Turn normalised PR records into a feature table for an open-time model.
 
-Rule: a feature may only use what was knowable at open time plus the
-first 24 hours of activity. So:
-- author history is counted from *earlier* PRs in the fetched window, not
-  from GitHub's author_association (which flips FIRST_TIME_CONTRIBUTOR to
-  CONTRIBUTOR once a PR merges);
-- comments and reviews count only the first 24 h and stop before the close;
+Rule: score a PR as it looks when it is opened. So:
+- author history is counted only from PRs in `history` that closed before
+  this PR was created, never from GitHub's author_association (which flips
+  FIRST_TIME_CONTRIBUTOR to CONTRIBUTOR once a PR merges); callers pass the
+  training PRs as `history` so held-out outcomes never leak in;
+- comments, reviews and time-to-close are not features at all;
 - labels that maintainers add as a verdict (stale, wontfix, accepted,
-  invalid, ...) are ignored;
-- time-to-close is never a feature.
+  invalid, ...) are ignored.
+Known gap: GitHub only returns a PR's *current* size, files, title, body and
+labels, so edits after opening (and late topic labels) can still seep in.
 """
 
 from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 FEATURES = [
     "additions",
@@ -31,8 +32,6 @@ FEATURES = [
     "title_len",
     "body_len",
     "conventional_title",
-    "n_comments_24h",
-    "n_reviews_24h",
     "label_bug",
     "label_docs",
     "label_feature",
@@ -54,8 +53,6 @@ FEATURE_LABELS = {
     "title_len": "Title length",
     "body_len": "Description length",
     "conventional_title": "Conventional title (feat:/fix:)",
-    "n_comments_24h": "Comments in first 24 h",
-    "n_reviews_24h": "Reviews in first 24 h",
     "label_bug": "Label: bug",
     "label_docs": "Label: docs",
     "label_feature": "Label: feature",
@@ -81,16 +78,21 @@ def parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def touches_tests(files: list[str] | None) -> float:
+def touches_tests(files: list[str] | None, changed_files: int | None = None) -> float:
     if files is None:
         return math.nan
-    return float(any(TEST_PATH_RE.search(f) for f in files))
+    if any(TEST_PATH_RE.search(f) for f in files):
+        return 1.0
+    # GitHub returns only the first files; an unseen one could be a test.
+    return math.nan if changed_files and changed_files > len(files) else 0.0
 
 
-def docs_only(files: list[str] | None) -> float:
+def docs_only(files: list[str] | None, changed_files: int | None = None) -> float:
     if not files:
         return math.nan if files is None else 0.0
-    return float(all(DOC_PATH_RE.search(f) for f in files))
+    if not all(DOC_PATH_RE.search(f) for f in files):
+        return 0.0
+    return math.nan if changed_files and changed_files > len(files) else 1.0
 
 
 def has_linked_issue(body: str) -> float:
@@ -112,34 +114,17 @@ def label_flags(labels: list[str]) -> dict[str, float]:
     }
 
 
-def early_activity(events: list[dict] | None, author: str, created: datetime, closed: datetime | None) -> float:
-    """Count events by people other than the author in the first 24 h, before the close."""
-    if events is None:
-        return math.nan
-    end = created + timedelta(hours=24)
-    if closed is not None:
-        # Drop the closing comment itself ("closing as stale", "thanks, merged").
-        end = min(end, closed - timedelta(minutes=10))
-    count = 0
-    for e in events:
-        at = parse_time(e["at"])
-        if e.get("by") != author and at is not None and at < end:
-            count += 1
-    return float(count)
-
-
 def _num(value) -> float:
     return math.nan if value is None else float(value)
 
 
 def pr_features(pr: dict, history: list[dict]) -> dict[str, float]:
-    """Features for one PR. `history` is every closed PR in the window (any order)."""
+    """Features for one PR. `history` is the closed PRs whose outcomes may be used (any order)."""
     created = parse_time(pr["created_at"])
-    closed = parse_time(pr.get("closed_at"))
-    author = pr["author"]
-    earlier = [
+    author = pr.get("author")
+    earlier = [] if author is None else [
         h for h in history
-        if h["author"] == author and h["number"] != pr["number"]
+        if h.get("author") == author and h["number"] != pr["number"]
         and parse_time(h.get("closed_at")) is not None and parse_time(h["closed_at"]) < created
     ]
     title = pr.get("title") or ""
@@ -148,18 +133,16 @@ def pr_features(pr: dict, history: list[dict]) -> dict[str, float]:
         "additions": _num(pr.get("additions")),
         "deletions": _num(pr.get("deletions")),
         "changed_files": _num(pr.get("changed_files")),
-        "touches_tests": touches_tests(pr.get("files")),
-        "docs_only": docs_only(pr.get("files")),
+        "touches_tests": touches_tests(pr.get("files"), pr.get("changed_files")),
+        "docs_only": docs_only(pr.get("files"), pr.get("changed_files")),
         "is_maintainer": float(pr.get("author_association") in MAINTAINER_ASSOCIATIONS),
-        "is_bot": float(bool(pr.get("author_is_bot")) or author.endswith("[bot]")),
+        "is_bot": float(bool(pr.get("author_is_bot")) or (author or "").endswith("[bot]")),
         "author_prior_merged": float(sum(1 for h in earlier if h["merged"])),
         "author_prior_unmerged": float(sum(1 for h in earlier if not h["merged"])),
         "has_linked_issue": has_linked_issue(body),
         "title_len": float(len(title)),
         "body_len": float(len(body)),
         "conventional_title": float(bool(CONVENTIONAL_RE.match(title.strip()))),
-        "n_comments_24h": early_activity(pr.get("comments"), author, created, closed),
-        "n_reviews_24h": early_activity(pr.get("reviews"), author, created, closed),
     }
     feats.update(label_flags(pr.get("labels") or []))
     return feats
@@ -168,7 +151,8 @@ def pr_features(pr: dict, history: list[dict]) -> dict[str, float]:
 def build_dataset(prs: list[dict]):
     """Split PRs into (closed features, merged labels, closed PRs, open features, open PRs).
 
-    Returns plain lists of feature dicts so this module needs no pandas.
+    Every closed outcome is usable here, which is right for scoring open PRs
+    now. Evaluation must not use this: see model.split_features.
     """
     closed = [p for p in prs if p["state"] == "closed"]
     opened = [p for p in prs if p["state"] == "open"]
@@ -207,8 +191,6 @@ def draft_features(
         "title_len": float(len(title)),
         "body_len": float(len(body)),
         "conventional_title": float(bool(CONVENTIONAL_RE.match(title.strip()))),
-        "n_comments_24h": 0.0,
-        "n_reviews_24h": 0.0,
     }
     feats.update(label_flags(labels))
     return feats

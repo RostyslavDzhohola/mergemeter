@@ -1,8 +1,8 @@
 """Fetch pull requests for a public GitHub repo and normalise them.
 
 Two paths:
-- GraphQL (needs GITHUB_TOKEN): sizes, file paths, comment and review
-  timestamps for every PR in a handful of requests.
+- GraphQL (needs GITHUB_TOKEN): sizes and file paths for every PR in a
+  handful of requests. Private repos are refused even if the token sees them.
 - REST without a token: the list endpoint only (no sizes or files), so the
   size features are left missing. TabPFN handles missing values natively.
 
@@ -25,12 +25,15 @@ API = "https://api.github.com"
 CACHE_DIR = Path(os.environ.get("MERGEMETER_CACHE", Path(__file__).resolve().parent.parent / "data" / "cache"))
 SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "data" / "snapshots"
 CACHE_TTL = 6 * 3600
+CLOSED_LIMIT = 300
+OPEN_LIMIT = 100
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $states: [PullRequestState!], $first: Int!, $after: String) {
   rateLimit { remaining resetAt }
   repository(owner: $owner, name: $name) {
+    isPrivate
     pullRequests(states: $states, first: $first, after: $after,
                  orderBy: {field: CREATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
@@ -40,8 +43,6 @@ query($owner: String!, $name: String!, $states: [PullRequestState!], $first: Int
         author { login __typename }
         labels(first: 20) { nodes { name } }
         files(first: 30) { nodes { path } }
-        comments(first: 20) { nodes { createdAt author { login } } }
-        reviews(first: 20) { nodes { createdAt author { login } } }
       }
     }
   }
@@ -101,6 +102,9 @@ def _graphql_nodes(repo: str, states: list[str], limit: int, token: str) -> list
         repo_data = payload["data"]["repository"]
         if repo_data is None:
             raise GitHubError(f"Repository {repo} not found")
+        if repo_data["isPrivate"]:
+            # The server's token may see private repos; never serve them to visitors.
+            raise GitHubError(f"Repository {repo} not found")
         conn = repo_data["pullRequests"]
         nodes.extend(conn["nodes"])
         if not conn["pageInfo"]["hasNextPage"]:
@@ -121,7 +125,7 @@ def _from_graphql(node: dict) -> dict:
         "created_at": node["createdAt"],
         "closed_at": node.get("closedAt"),
         "merged_at": node.get("mergedAt"),
-        "author": author.get("login") or "ghost",
+        "author": author.get("login"),  # None for deleted accounts: no shared "ghost" history
         "author_is_bot": author.get("__typename") == "Bot",
         "author_association": node.get("authorAssociation") or "NONE",
         "additions": node.get("additions"),
@@ -129,14 +133,6 @@ def _from_graphql(node: dict) -> dict:
         "changed_files": node.get("changedFiles"),
         "files": [f["path"] for f in (node.get("files") or {}).get("nodes") or []],
         "labels": [lbl["name"] for lbl in node["labels"]["nodes"]],
-        "comments": [
-            {"at": c["createdAt"], "by": (c.get("author") or {}).get("login")}
-            for c in node["comments"]["nodes"]
-        ],
-        "reviews": [
-            {"at": r["createdAt"], "by": (r.get("author") or {}).get("login")}
-            for r in node["reviews"]["nodes"]
-        ],
     }
 
 
@@ -152,7 +148,7 @@ def _from_rest(item: dict) -> dict:
         "created_at": item["created_at"],
         "closed_at": item.get("closed_at"),
         "merged_at": item.get("merged_at"),
-        "author": user.get("login") or "ghost",
+        "author": user.get("login"),
         "author_is_bot": user.get("type") == "Bot",
         "author_association": item.get("author_association") or "NONE",
         # Not in the list endpoint; left missing on purpose.
@@ -161,8 +157,6 @@ def _from_rest(item: dict) -> dict:
         "changed_files": None,
         "files": None,
         "labels": [lbl["name"] for lbl in item.get("labels") or []],
-        "comments": None,
-        "reviews": None,
     }
 
 
@@ -190,7 +184,7 @@ def _rest_list(repo: str, state: str, limit: int) -> list[dict]:
     return items[:limit]
 
 
-def fetch_prs(repo: str, closed_limit: int = 300, open_limit: int = 100, use_cache: bool = True) -> dict:
+def fetch_prs(repo: str, closed_limit: int = CLOSED_LIMIT, open_limit: int = OPEN_LIMIT, use_cache: bool = True) -> dict:
     """Return {"repo", "mode", "fetched_at", "prs": [...]} for a public repo."""
     repo = parse_repo(repo)
     token = _token()

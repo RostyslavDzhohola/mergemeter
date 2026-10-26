@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import math
 import os
 
 import gradio as gr
@@ -26,6 +27,7 @@ CSS = """
 .mm-table th { text-align: left; color: #b9a8cc; font-weight: 600; border-bottom: 1px solid #3b2a4d; padding: 6px; }
 .mm-table td { border-bottom: 1px solid #241a30; padding: 6px; vertical-align: middle; }
 .mm-table a { color: #ffb36b; text-decoration: none; }
+.mm-table td.mm-p { white-space: nowrap; }
 .mm-meter { position: relative; height: 10px; width: 120px; background: #2a1f36; border-radius: 6px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 8px; }
 .mm-meter i { position: absolute; inset: 0 auto 0 0; border-radius: 6px; }
 .mm-bars .row { display: grid; grid-template-columns: 220px 1fr 64px; gap: 10px; align-items: center; margin: 5px 0; font-size: .88rem; }
@@ -55,7 +57,7 @@ def summary_html(res: dict) -> str:
     stats = [
         (res["n_closed"], "closed PRs summoned"),
         (f"{rate:.0f}%", "of them merged"),
-        (res["n_open"], "open PRs scored"),
+        (res["n_open"], "newest open PRs scored" if res["open_capped"] else "open PRs scored"),
         (auc_txt, "ROC-AUC on newest 20%"),
         (f"{res['seconds']['total']:.0f}s", "fetch + TabPFN on CPU"),
     ]
@@ -73,7 +75,7 @@ def table_html(res: dict) -> str:
         rows.append(
             f"<tr><td><a href='{html.escape(r.Link)}' target='_blank'>{r.PR}</a></td>"
             f"<td>{html.escape(r.Title)}</td><td>{html.escape(r.Author)}</td>"
-            f"<td><span class='mm-meter'><i style='width:{p}%;background:{_color(p)}'></i></span><b>{p}%</b></td>"
+            f"<td class='mm-p'><span class='mm-meter'><i style='width:{p}%;background:{_color(p)}'></i></span><b>{p}%</b></td>"
             f"<td>{_spirit(p)}</td></tr>"
         )
     head = "<tr><th>PR</th><th>Title</th><th>Author</th><th>Merge chance</th><th>Fate</th></tr>"
@@ -105,11 +107,16 @@ def run(repo_text: str):
     except (github.GitHubError, NotEnoughHistory) as e:
         raise gr.Error(str(e))
     medians = res["medians"]
+
+    def median_or(key: str, default: int) -> int:
+        value = medians.get(key)
+        return int(value) if value is not None and math.isfinite(value) else default  # NaN in lite mode
+
     return (
         summary_html(res), table_html(res), factors_html(res), res["repo"],
-        gr.update(value=int(medians.get("additions") or 40)),
-        gr.update(value=int(medians.get("deletions") or 10)),
-        gr.update(value=int(medians.get("changed_files") or 2)),
+        gr.update(value=median_or("additions", 40)),
+        gr.update(value=median_or("deletions", 10)),
+        gr.update(value=median_or("changed_files", 2)),
     )
 
 
@@ -136,8 +143,8 @@ with gr.Blocks(title="MergeMeter: will my PR get merged?") as demo:
         "# 👻 MergeMeter\n"
         "**The ghosts of PRs past predict the fate of PRs present.** Point it at a public repo: it summons the last "
         "300 closed pull requests, and a local open-weight [TabPFN](https://github.com/PriorLabs/TabPFN) model "
-        "learns *in context* which ones lived (merged) and which became ghosts (closed unmerged), then scores every "
-        "open PR. No training loop and no hosted API: the model runs on this machine's CPU.",
+        "learns *in context* which ones lived (merged) and which became ghosts (closed unmerged), then scores up to "
+        "100 open PRs. No training loop and no hosted API: the model runs on this machine's CPU.",
         elem_id="title",
     )
     with gr.Row():
@@ -158,11 +165,12 @@ with gr.Blocks(title="MergeMeter: will my PR get merged?") as demo:
                 del_in = gr.Number(label="Lines deleted", value=10, precision=0)
                 files_in = gr.Number(label="Files changed", value=2, precision=0)
             with gr.Row():
+                merged_in = gr.Number(label="My earlier merged PRs", value=0, precision=0)
+                rejected_in = gr.Number(label="My earlier unmerged PRs", value=0, precision=0)
+            with gr.Row():
                 tests_in = gr.Checkbox(label="Touches tests")
                 docs_in = gr.Checkbox(label="Docs only")
                 maint_in = gr.Checkbox(label="I'm a maintainer")
-                merged_in = gr.Number(label="My earlier merged PRs here", value=0, precision=0)
-                rejected_in = gr.Number(label="My earlier unmerged PRs here", value=0, precision=0)
             title_in = gr.Textbox(label="Title", value="fix: handle empty response body")
             body_in = gr.Textbox(label="Description", lines=3, value="Fixes #123. Adds a regression test.")
             labels_in = gr.CheckboxGroup(["bug", "documentation", "enhancement", "hacktoberfest", "dependencies"], label="Labels")
